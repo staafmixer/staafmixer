@@ -1,5 +1,6 @@
 pub mod consts;
 mod ingest;
+mod janus;
 
 use crate::ingest::ingest_server;
 use tokio::task::spawn;

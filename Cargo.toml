@@ -1,4 +1,5 @@
 [workspace]
 members = [
-  "staaf-ingest"
+  "staaf-ingest",
+  "staaf-janus"
 ]

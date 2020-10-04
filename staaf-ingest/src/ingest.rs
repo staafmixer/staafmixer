@@ -1,7 +1,8 @@
-use crate::consts::INGEST_PORT;
-use hex::{encode_to_slice, FromHex};
+use crate::consts::{FTL_INGEST_RESP_OK, INGEST_PORT};
+use hex::{encode, FromHex};
 use rand::random;
 use ring::hmac::{verify, Key, HMAC_SHA512};
+use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -31,6 +32,7 @@ struct ControlConnection {
     shared_secret: Vec<u8>,
     channel_id: Option<u64>,
     authenticated: bool,
+    metadata: HashMap<String, String>,
 }
 
 impl ControlConnection {
@@ -41,6 +43,7 @@ impl ControlConnection {
             shared_secret: random::<[u8; 8]>().to_vec(),
             channel_id: None,
             authenticated: false,
+            metadata: HashMap::new(),
         }
     }
 
@@ -54,9 +57,10 @@ impl ControlConnection {
             return Err(());
         }
 
-        let mut resp: [u8; 21] = *b"200 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\n";
-        encode_to_slice(&self.shared_secret, &mut resp[4..20]).map_err(|_| ())?;
-        self.tcp_stream.write(&resp).await.map_err(|_| ())?;
+        self.tcp_stream
+            .write(format!("{} {}\n", FTL_INGEST_RESP_OK, encode(&self.shared_secret)).as_bytes())
+            .await
+            .map_err(|_| ())?;
         let mut buffer = [0u8; 1024];
         let mut offset = 0;
         while !buffer[..offset].ends_with(b"\r\n\r\n") {
@@ -92,7 +96,7 @@ impl ControlConnection {
 
         println!("Connection from {} with channel {}", self.addr, channel_id);
 
-        // Fetch key by channel id
+        // TODO: Fetch key by channel id
         let key = b"staaf";
         let hmac_key = Key::new(HMAC_SHA512, key);
 
@@ -105,6 +109,47 @@ impl ControlConnection {
             self.addr, channel_id
         );
 
+        self.tcp_stream
+            .write(format!("{}\n", FTL_INGEST_RESP_OK).as_bytes())
+            .await
+            .map_err(|_| ())?;
+        Ok(())
+    }
+
+    async fn read_stream_info(&mut self) -> Result<(), ()> {
+        let mut recv_buffer = [0u8; 1024];
+        let mut buffer = vec![];
+        loop {
+            let len = self
+                .tcp_stream
+                .read(&mut recv_buffer)
+                .await
+                .map_err(|_| ())?;
+            if len == 0 {
+                return Err(());
+            }
+
+            buffer.extend_from_slice(&recv_buffer[..len]);
+
+            if buffer.ends_with(b".\r\n\r\n") {
+                break;
+            }
+        }
+
+        let headers = String::from_utf8(buffer).map_err(|_| ())?;
+        println!("{:?}", headers);
+        for line in headers.split("\r\n\r\n") {
+            if line == "." {
+                break;
+            }
+
+            let mut splitter = line.splitn(2, ": ");
+            let name = splitter.next().ok_or(())?;
+            let value = splitter.next().ok_or(())?;
+
+            self.metadata.insert(name.to_string(), value.to_string());
+        }
+
         Ok(())
     }
 }
@@ -112,6 +157,9 @@ impl ControlConnection {
 async fn ingest_connection(stream: TcpStream) -> Result<(), ()> {
     let mut connection = ControlConnection::new(stream);
     connection.handshake().await?;
+    connection.read_stream_info().await?;
 
+    println!("Received metadata: {:?}", connection.metadata);
+    // Verify metadata and request port @ janus
     Ok(())
 }

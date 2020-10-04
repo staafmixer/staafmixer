@@ -1,0 +1,11 @@
+[package]
+name = "staaf-ingest"
+version = "0.1.0"
+authors = ["eater <=@eater.me>"]
+edition = "2018"
+
+[dependencies]
+tokio = { version = "0.2.22", features = ["full"] }
+ring = "0.16"
+rand = "0.7.3"
+hex = "0.4.2"

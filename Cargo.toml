@@ -1,5 +1,7 @@
 [workspace]
 members = [
   "staaf-ingest",
+  "staaf-core",
+  "staaf-janus-client",
   "staaf-janus"
 ]

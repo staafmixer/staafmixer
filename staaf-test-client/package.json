@@ -1,0 +1,9 @@
+{
+  "devDependencies": {
+    "parcel": "^1.12.4"
+  },
+  "dependencies": {
+    "babel-polyfill": "^6.26.0",
+    "minijanus": "^0.6.2"
+  }
+}

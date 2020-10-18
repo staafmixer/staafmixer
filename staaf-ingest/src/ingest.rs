@@ -1,15 +1,37 @@
-use crate::consts::{FTL_INGEST_RESP_OK, INGEST_PORT};
+use crate::consts::{FTL_INGEST_RESP_OK, FTL_INGEST_RESP_PING, INGEST_PORT};
 use hex::{encode, FromHex};
 use rand::random;
 use ring::hmac::{verify, Key, HMAC_SHA512};
+use staaf_core::rpc::{
+    AudioCodec, MediaStream, MediaStreamAudio, MediaStreamContent, MediaStreamVideo,
+    RegisterStream, StaafRPC, VideoCodec,
+};
+use staaf_core::StreamId;
+use staaf_janus_client::{JanusConnection, JanusMessageData, JanusPluginOwned, JanusPluginOwner};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::stream::StreamExt;
 use tokio::task::spawn;
+use tokio::time::{delay_for, Duration};
 
 pub async fn ingest_server() {
+    let mut janus_connection = JanusConnection::parse("ws://localhost:8188").unwrap();
+    janus_connection.start().await;
+    let session = janus_connection
+        .create_session()
+        .await
+        .expect("Failed to create Janus Session");
+    let session = Arc::new(session);
+
+    let plugin = session
+        .attach_owned("eater.staafmixer")
+        .await
+        .expect("Failed to attach staafmixer plugin");
+
     let mut listener =
         TcpListener::bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), INGEST_PORT))
             .await
@@ -18,7 +40,7 @@ pub async fn ingest_server() {
     while let Some(connection) = listener.next().await {
         match connection {
             Ok(stream) => {
-                spawn(ingest_connection(stream));
+                spawn(ingest_connection(stream, plugin.clone()));
             }
             Err(err) => println!("Listening failed: {}", err),
         }
@@ -36,6 +58,12 @@ struct ControlConnection {
 }
 
 impl ControlConnection {
+    pub async fn send_port(&mut self, port: u16) {
+        self.tcp_stream
+            .write(format!("{}. Use UDP port {}\n", FTL_INGEST_RESP_OK, port).as_bytes())
+            .await;
+    }
+
     pub fn new(tcp_stream: TcpStream) -> ControlConnection {
         ControlConnection {
             addr: tcp_stream.peer_addr().unwrap(),
@@ -152,14 +180,111 @@ impl ControlConnection {
 
         Ok(())
     }
+
+    async fn send_ping(&mut self) -> tokio::io::Result<usize> {
+        self.tcp_stream
+            .write(format!("{}", FTL_INGEST_RESP_PING).as_bytes())
+            .await
+    }
 }
 
-async fn ingest_connection(stream: TcpStream) -> Result<(), ()> {
+async fn ingest_connection(mut stream: TcpStream, plugin: JanusPluginOwned) -> Result<(), ()> {
+    let peer_addr = stream.peer_addr().map_err(|_| ())?.ip();
     let mut connection = ControlConnection::new(stream);
     connection.handshake().await?;
     connection.read_stream_info().await?;
 
     println!("Received metadata: {:?}", connection.metadata);
+
+    let mut rpc = RegisterStream {
+        media_streams: vec![],
+        peer_addr,
+        stream_id: connection.channel_id.ok_or(())? as StreamId,
+    };
+
+    if connection.metadata.get("Video").map(|x| x.as_str()) == Some("true") {
+        connection.metadata.get("VideoCodec");
+        let media_stream = MediaStream {
+            ssrc: connection
+                .metadata
+                .get("VideoIngestSSRC")
+                .ok_or(())?
+                .parse()
+                .map_err(|_| ())?,
+            payload_type: connection
+                .metadata
+                .get("VideoPayloadType")
+                .ok_or(())?
+                .parse::<u16>()
+                .map_err(|_| ())?,
+            content: MediaStreamContent::Video(MediaStreamVideo {
+                codec: VideoCodec::H264,
+                width: 0,
+                height: 0,
+            }),
+        };
+
+        rpc.media_streams.push(media_stream);
+    }
+
+    if connection.metadata.get("Audio").map(|x| x.as_str()) == Some("true") {
+        connection.metadata.get("AudioCodec");
+        let media_stream = MediaStream {
+            ssrc: connection
+                .metadata
+                .get("AudioIngestSSRC")
+                .ok_or(())?
+                .parse()
+                .map_err(|_| ())?,
+            payload_type: connection
+                .metadata
+                .get("AudioPayloadType")
+                .ok_or(())?
+                .parse()
+                .map_err(|_| ())?,
+            content: MediaStreamContent::Audio(MediaStreamAudio {
+                codec: AudioCodec::Opus,
+            }),
+        };
+
+        rpc.media_streams.push(media_stream);
+    }
+
+    println!("Sending StaafRPC message to Janus: {:?}", rpc);
+    let resp = plugin
+        .send(
+            "message",
+            JanusMessageData::Body {
+                body: StaafRPC::RegisterStream(rpc),
+            },
+        )
+        .await
+        .expect("Failed to communicate with Janus");
+
+    let data = resp
+        .extract::<StaafRPC>()
+        .expect("Failed to read message from Janus");
+
     // Verify metadata and request port @ janus
+    if let StaafRPC::StreamRegistered { port } = data {
+        connection.send_port(port).await;
+    } else {
+        panic!("Got wrong response")
+    }
+
+    spawn(async move {
+        loop {
+            let mut x = vec![0u8; 4096];
+            let s = connection.tcp_stream.read(&mut x).await.unwrap();
+            let x = String::from_utf8_lossy(&x[..s]);
+            if "PING" == x.split(" ").next().unwrap() {
+                connection
+                    .tcp_stream
+                    .write(format!("{}\r\n\r\n", FTL_INGEST_RESP_PING).as_bytes())
+                    .await;
+            }
+        }
+    });
+
     Ok(())
 }

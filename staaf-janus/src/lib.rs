@@ -1,51 +1,72 @@
-mod rpc;
+#![allow(unused_unsafe)]
 
-use crate::rpc::{MediaStream, StaafRPC};
+mod router;
+mod rtp_receiver;
+
+use crate::router::Router;
+use crate::rtp_receiver::RTPReceiver;
+use discortp::rtcp::report::{ReceiverReportPacket, ReportBlockIterable, ReportBlockPacket};
+use discortp::rtcp::RtcpType::ReceiverReport;
+use discortp::FromPacket;
+use glib_sys::g_list_append;
 use janus_plugin::sdp::Sdp;
 use janus_plugin::*;
+use janus_plugin_sys::rtcp::janus_rtcp_get_remb;
+use janus_plugin_sys::sdp::janus_sdp_mdirection::JANUS_SDP_SENDONLY;
+use janus_plugin_sys::sdp::janus_sdp_mtype::{JANUS_SDP_AUDIO, JANUS_SDP_VIDEO};
+use janus_plugin_sys::sdp::{
+    janus_sdp_attribute_add_to_mline, janus_sdp_attribute_create, janus_sdp_mline_create,
+    janus_sdp_new,
+};
 use serde::de::DeserializeOwned;
-use std::collections::{HashMap, HashSet};
-use std::convert::TryInto;
-use std::ffi::CStr;
-use std::net::{IpAddr, UdpSocket};
+use serde::export::fmt::Debug;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use staaf_core::rpc::{
+    AudioCodec, MediaStream, MediaStreamAudio, MediaStreamContent, MediaStreamVideo, StaafRPC,
+    VideoCodec,
+};
+use staaf_core::StreamId;
+use std::collections::HashSet;
+use std::ffi::{CStr, CString};
+use std::mem;
+use std::net::{IpAddr, Ipv4Addr};
 use std::option::Option::Some;
-use std::os::raw::{c_char, c_int};
-use std::ptr::null_mut;
+use std::os::raw::{c_char, c_int, c_void};
+use std::ptr::{null, null_mut};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 static mut CALLBACKS: Option<&PluginCallbacks> = None;
 static mut ROUTER: Option<Arc<RwLock<Router>>> = None;
 
-type StreamId = u32;
-
 #[derive(Debug, Copy, Clone, Hash, Ord, PartialOrd, Eq, PartialEq)]
-struct IncomingStreamHandle {
+pub struct IncomingStreamHandle {
     ssrc: u32,
     incoming_port: u16,
     peer_addr: IpAddr,
 }
 
-struct Stream {
-    id: StreamId,
+pub struct Stream {
+    _id: StreamId,
     media_streams: Vec<MediaStream>,
-    port: u16,
-    peer_addr: IpAddr,
+    _port: u16,
+    _peer_addr: IpAddr,
     subscribers: Vec<SessionRef>,
 }
 
 impl Stream {
     fn new(id: StreamId, media_streams: Vec<MediaStream>, port: u16, peer_addr: IpAddr) -> Stream {
         Stream {
-            id,
+            _id: id,
             media_streams,
-            port,
-            peer_addr,
+            _port: port,
+            _peer_addr: peer_addr,
             subscribers: Default::default(),
         }
     }
 }
 
-struct SessionState {
+pub struct SessionState {
     subscribed_to: RwLock<HashSet<StreamId>>,
 }
 
@@ -67,111 +88,7 @@ impl SessionState {
     }
 }
 
-struct Router {
-    sessions: HashSet<Box<SessionRef>>,
-    streams: HashMap<StreamId, Stream>,
-    stream_map: HashMap<IncomingStreamHandle, StreamId>,
-}
-
-static EMPTY_SUBSCRIBERS: Vec<SessionRef> = vec![];
-
-impl Router {
-    fn new() -> Router {
-        Router {
-            sessions: Default::default(),
-            streams: Default::default(),
-            stream_map: Default::default(),
-        }
-    }
-
-    pub fn disconnect(&mut self, session: SessionRef) {
-        self.sessions.retain(|item| item.handle != session.handle);
-        for stream_id in session.subscribed_to() {
-            self.remove_route(&session, stream_id);
-        }
-    }
-
-    fn connect(&mut self, session: Box<SessionRef>) {
-        self.sessions.insert(session);
-    }
-
-    fn remove_route(&mut self, session: &SessionRef, stream_id: StreamId) {
-        let stream = if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream
-        } else {
-            return;
-        };
-
-        stream.subscribers.retain(|item| Arc::ptr_eq(item, session));
-    }
-
-    fn add_route(&mut self, session: &SessionRef, stream_id: StreamId) {
-        session.subscribe(stream_id);
-        let stream = if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream
-        } else {
-            return;
-        };
-
-        stream.subscribers.push(Arc::clone(session));
-    }
-
-    fn get_stream(&self, stream_index: StreamId) -> Option<&Stream> {
-        self.streams.get(&stream_index)
-    }
-
-    fn get_stream_id(&self, ssrc: u32, port: u16, ip_addr: IpAddr) -> Option<StreamId> {
-        self.stream_map
-            .get(&IncomingStreamHandle {
-                ssrc,
-                incoming_port: port,
-                peer_addr: ip_addr,
-            })
-            .copied()
-    }
-
-    fn register_stream(
-        &mut self,
-        stream_index: StreamId,
-        media_streams: Vec<MediaStream>,
-        port: u16,
-        ip_addr: IpAddr,
-    ) {
-        let stream = Stream::new(stream_index, media_streams.clone(), port, ip_addr);
-        self.streams.insert(stream_index, stream);
-        for media_stream in media_streams {
-            self.stream_map.insert(
-                IncomingStreamHandle {
-                    ssrc: media_stream.ssrc,
-                    incoming_port: port,
-                    peer_addr: ip_addr,
-                },
-                stream_index,
-            );
-        }
-    }
-
-    fn destroy_stream(&mut self, stream_index: StreamId) {
-        if let Some(stream) = self.streams.remove(&stream_index) {
-            for media_stream in stream.media_streams {
-                self.stream_map.remove(&IncomingStreamHandle {
-                    ssrc: media_stream.ssrc,
-                    incoming_port: stream.port,
-                    peer_addr: stream.peer_addr,
-                });
-            }
-        }
-    }
-
-    fn get_subscribers(&self, stream_index: StreamId) -> &Vec<SessionRef> {
-        if let Some(stream) = self.streams.get(&stream_index) {
-            &stream.subscribers
-        } else {
-            &EMPTY_SUBSCRIBERS
-        }
-    }
-}
-
+#[macro_export]
 macro_rules! or_continue {
     ($data:expr) => {
         if let Some(data) = $data {
@@ -182,6 +99,7 @@ macro_rules! or_continue {
     };
 }
 
+#[macro_export]
 macro_rules! or_return {
     ($data:expr) => {
         if let Some(data) = $data {
@@ -208,62 +126,15 @@ impl SessionState {
     }
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(tag = "type", content = "sdp", rename_all = "lowercase")]
+enum JsepObject {
+    Offer(Sdp),
+    Answer(Sdp),
+}
+
 type Session = SessionWrapper<SessionState>;
 type SessionRef = Arc<Session>;
-
-struct RTPReceiver {
-    port: u16,
-    udp_socket: UdpSocket,
-}
-
-impl RTPReceiver {
-    fn new() -> RTPReceiver {
-        let socket = UdpSocket::bind("0.0.0.0:1445").unwrap();
-        RTPReceiver {
-            port: socket.peer_addr().unwrap().port(),
-            udp_socket: socket,
-        }
-    }
-
-    fn start(self) {
-        std::thread::spawn(move || {
-            self.receive();
-        });
-    }
-
-    fn receive(&self) {
-        let relay = callback().relay_rtp;
-        let mut buffer = [0u8; 4096];
-        while let Ok((len, addr)) = self.udp_socket.recv_from(&mut buffer) {
-            if len < 12 {
-                // wtf?
-                continue;
-            }
-
-            let ssrc = u32::from_be_bytes(buffer[8..12].try_into().unwrap());
-            let stream_id = or_continue!(router().get_stream_id(ssrc, self.port, addr.ip()));
-
-            let rtp = PluginRtpPacket {
-                video: if ssrc == stream_id { 1 } else { 0 },
-                buffer: buffer.as_mut_ptr().cast(),
-                length: len as i16,
-                extensions: janus_plugin::PluginRtpExtensions {
-                    audio_level: 0,
-                    audio_level_vad: 0,
-                    video_rotation: 0,
-                    video_back_camera: 0,
-                    video_flipped: 0,
-                },
-            };
-
-            let mut boxed = Box::new(rtp);
-
-            for subscriber in router().get_subscribers(stream_id) {
-                relay(subscriber.handle, boxed.as_mut());
-            }
-        }
-    }
-}
 
 // courtesy of c_string crate, which also has some other stuff we aren't interested in
 // taking in as a dependency here.
@@ -273,11 +144,34 @@ macro_rules! c_str {
     };
 }
 
-fn parse_json_raw<T: DeserializeOwned>(raw: *mut RawJanssonValue) -> Option<T> {
+trait SerializeJansson {
+    fn serialize_jansson(&self) -> JanssonValue {
+        return JanssonValue::from_str(&self.serialize_json(), JanssonDecodingFlags::empty())
+            .unwrap();
+    }
+
+    fn serialize_jansson_raw(&self) -> *mut RawJanssonValue {
+        self.serialize_jansson().into_raw()
+    }
+
+    fn serialize_json(&self) -> String;
+}
+
+impl<T: Serialize> SerializeJansson for T {
+    fn serialize_json(&self) -> String {
+        serde_json::to_string(&self).unwrap()
+    }
+}
+
+fn parse_json_raw<T: DeserializeOwned + Debug>(raw: *mut RawJanssonValue) -> Option<T> {
+    println!("JSON is null: {}", raw.is_null());
     let value = unsafe { JanssonValue::from_raw(raw) }?;
     let json_libc = value.to_libcstring(JanssonEncodingFlags::empty());
     let json = json_libc.to_str().ok()?;
-    serde_json::from_str::<T>(json).ok()
+    println!("Parsing: {}", json);
+    let res = serde_json::from_str::<T>(json);
+    println!("Parsed: {:?}", res);
+    res.ok()
 }
 
 fn callback() -> &'static PluginCallbacks {
@@ -310,6 +204,30 @@ extern "C" fn init(callbacks: *mut PluginCallbacks, _config_path: *const c_char)
     unsafe {
         ROUTER = Some(Arc::new(RwLock::new(Router::new())));
     }
+
+    router_mut().register_stream(
+        1337,
+        vec![
+            MediaStream {
+                ssrc: 1338,
+                payload_type: 96,
+                content: MediaStreamContent::Video(MediaStreamVideo {
+                    codec: VideoCodec::H264,
+                    width: 1280,
+                    height: 720,
+                }),
+            },
+            MediaStream {
+                ssrc: 1337,
+                payload_type: 97,
+                content: MediaStreamContent::Audio(MediaStreamAudio {
+                    codec: AudioCodec::Opus,
+                }),
+            },
+        ],
+        40,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    );
 
     match unsafe { callbacks.as_ref() } {
         Some(c) => unsafe { CALLBACKS = Some(c) },
@@ -345,8 +263,12 @@ extern "C" fn query_session(_handle: *mut PluginSession) -> *mut RawJanssonValue
 }
 
 extern "C" fn destroy_session(handle: *mut PluginSession, error: *mut c_int) {
+    println!("Staaf is destroying a session");
     match unsafe { Session::from_ptr(handle) } {
         Ok(session) => {
+            println!("Disconnecting session: {}", unsafe {
+                (*session.handle).plugin_handle as u64
+            });
             router_mut().disconnect(session);
         }
 
@@ -363,14 +285,17 @@ pub fn get_free_port(_media_streams: &Vec<MediaStream>) -> u16 {
 
 extern "C" fn handle_message(
     handle: *mut PluginSession,
-    _transaction: *mut c_char,
+    transaction: *mut c_char,
     message: *mut RawJanssonValue,
-    jsep: *mut RawJanssonValue,
+    _jsep: *mut RawJanssonValue,
 ) -> *mut RawPluginResult {
     let msg: StaafRPC = or_return!(
         parse_json_raw(message),
         PluginResult::error(c_str!("Message not found")).into_raw()
     );
+
+    println!("Message: {:?}", msg);
+
     match msg {
         StaafRPC::RegisterStream(reg) => {
             let new_port = get_free_port(&reg.media_streams);
@@ -378,27 +303,39 @@ extern "C" fn handle_message(
 
             PluginResult::ok(
                 JanssonValue::from_str(
-                    &format!("{{\"port\": {}}}", new_port),
+                    serde_json::to_string(&StaafRPC::StreamRegistered { port: new_port })
+                        .unwrap()
+                        .as_str(),
                     JanssonDecodingFlags::empty(),
                 )
                 .unwrap(),
             )
             .into_raw()
         }
-        StaafRPC::Subscribe(stream_id) => {
+        StaafRPC::Subscribe { stream_id } => {
             let wrapper = or_return!(
-                Session::from_ptr(handle).ok(),
+                unsafe { Session::from_ptr(handle) }.ok(),
                 PluginResult::error(c_str!("Session not found")).into_raw()
             );
+
+            if wrapper
+                .subscribed_to
+                .read()
+                .expect("Session poisoned")
+                .len()
+                > 0
+            {
+                return PluginResult::error(c_str!("No multistream support yet")).into_raw();
+            }
 
             router_mut().add_route(&wrapper, stream_id);
 
             PluginResult::ok(JanssonValue::from_str("{}", JanssonDecodingFlags::empty()).unwrap())
                 .into_raw()
         }
-        StaafRPC::Unsubscribe(stream_id) => {
+        StaafRPC::Unsubscribe { stream_id } => {
             let wrapper = or_return!(
-                Session::from_ptr(handle).ok(),
+                unsafe { Session::from_ptr(handle) }.ok(),
                 PluginResult::error(c_str!("Session not found")).into_raw()
             );
 
@@ -408,12 +345,106 @@ extern "C" fn handle_message(
                 .into_raw()
         }
         StaafRPC::Offer => {
-            let push = callback().push_event;
+            let wrapper = or_return!(
+                unsafe { Session::from_ptr(handle) }.ok(),
+                PluginResult::error(c_str!("Session not found")).into_raw()
+            );
 
-            // TODO: Handle offer and answer
+            let subscribe_to = wrapper.subscribed_to.read().expect("Session poisoned");
+            if subscribe_to.len() == 0 {
+                return PluginResult::ok(
+                    json!({
+                        "status": "empty"
+                    })
+                    .serialize_jansson(),
+                )
+                .into_raw();
+            }
 
-            PluginResult::ok_wait(Some(c_str!("Processing.")))
+            println!("Creating answer");
+
+            let media_streams = subscribe_to
+                .iter()
+                .filter_map(|channel_id| {
+                    router()
+                        .get_stream(*channel_id)
+                        .map(|stream| stream.media_streams.clone())
+                })
+                .flat_map(|list| list)
+                .collect::<Vec<_>>();
+
+            let offer = unsafe {
+                let sdp = janus_sdp_new(null(), c_str!("127.0.0.1").as_ptr());
+
+                for media_stream in media_streams {
+                    let mline = janus_sdp_mline_create(
+                        if let MediaStreamContent::Video(_) = &media_stream.content {
+                            JANUS_SDP_VIDEO
+                        } else {
+                            JANUS_SDP_AUDIO
+                        },
+                        1,
+                        c_str!("UDP/TLS/RTP/SAVPF").as_ptr(),
+                        JANUS_SDP_SENDONLY,
+                    );
+
+                    (*mline).ptypes = g_list_append(
+                        (*mline).ptypes,
+                        null_mut::<c_void>().offset(media_stream.payload_type as isize),
+                    );
+
+                    let codec_info = match &media_stream.content {
+                        MediaStreamContent::Audio(audio) => {
+                            format!("{}/48000/2", audio.codec.to_str())
+                        }
+                        MediaStreamContent::Video(video) => {
+                            format!("{}/90000", video.codec.to_str())
+                        }
+                    };
+                    let c_str =
+                        CString::new(format!("{} {}", media_stream.payload_type, codec_info))
+                            .unwrap();
+                    let rtpmap =
+                        janus_sdp_attribute_create(c_str!("rtpmap").as_ptr(), c_str.as_ptr());
+                    janus_sdp_attribute_add_to_mline(mline, rtpmap);
+
+                    match &media_stream.content {
+                        MediaStreamContent::Video(_video) => {
+                            let c_str = CString::new(format!(
+                                "{} profile-level-id=42e01f;level-asymmetry-allowed=1",
+                                media_stream.payload_type
+                            ))
+                            .unwrap();
+                            let fmtp =
+                                janus_sdp_attribute_create(c_str!("fmtp").as_ptr(), c_str.as_ptr());
+                            janus_sdp_attribute_add_to_mline(mline, fmtp);
+                        }
+                        _ => {}
+                    }
+
+                    (*sdp).m_lines = g_list_append((*sdp).m_lines, mline.cast());
+                }
+
+                Sdp::new(sdp).unwrap()
+            };
+
+            (callback().push_event)(
+                handle,
+                &mut PLUGIN,
+                transaction,
+                json!({ "status": "offer" }).serialize_jansson_raw(),
+                json!({ "type": "offer", "sdp": offer}).serialize_jansson_raw(),
+            );
+
+            println!("Generated SDP offer: {:?}", offer);
+
+            PluginResult::ok_wait(None).into_raw()
         }
+        StaafRPC::Answer => {
+            return PluginResult::ok(json!({}).serialize_jansson()).into_raw();
+        }
+
+        _ => PluginResult::error(c_str!("Answer given as request")).into_raw(),
     }
 }
 
@@ -428,9 +459,27 @@ extern "C" fn incoming_rtp(
 }
 
 extern "C" fn incoming_rtcp(
-    _handle: *mut PluginSession,
-    _packet: *mut janus_plugin::PluginRtcpPacket,
+    handle: *mut PluginSession,
+    packet: *mut janus_plugin::PluginRtcpPacket,
 ) {
+    let xx = unsafe {
+        Vec::from_raw_parts(
+            (*packet).buffer.cast::<u8>(),
+            (*packet).length as usize,
+            (*packet).length as usize,
+        )
+    };
+    let pkt = xx.clone();
+    mem::forget(xx);
+
+    println!(
+        "{} => {:?}",
+        handle as i64,
+        ReceiverReportPacket::owned(pkt)
+            .map(|x| x.from_packet())
+            .and_then(|x| ReportBlockPacket::owned(x.payload))
+            .map(|x| x.from_packet())
+    );
 }
 
 unsafe extern "C" fn handle_admin_message(_message: *mut RawJanssonValue) -> *mut RawJanssonValue {

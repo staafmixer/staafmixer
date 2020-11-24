@@ -1,16 +1,14 @@
 #![allow(unused_unsafe)]
 
 mod router;
-mod rtp_receiver;
+mod threaded_rtp_handler;
 
 use crate::router::Router;
-use crate::rtp_receiver::RTPReceiver;
-use discortp::rtcp::report::{ReceiverReportPacket, ReportBlockIterable, ReportBlockPacket};
-use discortp::rtcp::RtcpType::ReceiverReport;
-use discortp::FromPacket;
+use crate::threaded_rtp_handler::start_ingest;
 use glib_sys::g_list_append;
 use janus_plugin::sdp::Sdp;
 use janus_plugin::*;
+use janus_plugin_sys::plugin::{janus_plugin_rtp, janus_plugin_rtp_extensions};
 use janus_plugin_sys::rtcp::janus_rtcp_get_remb;
 use janus_plugin_sys::sdp::janus_sdp_mdirection::JANUS_SDP_SENDONLY;
 use janus_plugin_sys::sdp::janus_sdp_mtype::{JANUS_SDP_AUDIO, JANUS_SDP_VIDEO};
@@ -27,7 +25,7 @@ use staaf_core::rpc::{
     VideoCodec,
 };
 use staaf_core::StreamId;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr};
@@ -52,6 +50,7 @@ pub struct Stream {
     _port: u16,
     _peer_addr: IpAddr,
     subscribers: Vec<SessionRef>,
+    keyframe_buffer: HashMap<u32, Vec<Vec<u8>>>,
 }
 
 impl Stream {
@@ -62,6 +61,7 @@ impl Stream {
             _port: port,
             _peer_addr: peer_addr,
             subscribers: Default::default(),
+            keyframe_buffer: Default::default(),
         }
     }
 }
@@ -174,11 +174,11 @@ fn parse_json_raw<T: DeserializeOwned + Debug>(raw: *mut RawJanssonValue) -> Opt
     res.ok()
 }
 
-fn callback() -> &'static PluginCallbacks {
+pub fn callback() -> &'static PluginCallbacks {
     unsafe { CALLBACKS.expect("Failed to get callbacks, has init() not run yet?") }
 }
 
-fn router() -> RwLockReadGuard<'static, Router> {
+pub fn router() -> RwLockReadGuard<'static, Router> {
     unsafe {
         ROUTER
             .as_ref()
@@ -205,29 +205,29 @@ extern "C" fn init(callbacks: *mut PluginCallbacks, _config_path: *const c_char)
         ROUTER = Some(Arc::new(RwLock::new(Router::new())));
     }
 
-    router_mut().register_stream(
-        1337,
-        vec![
-            MediaStream {
-                ssrc: 1338,
-                payload_type: 96,
-                content: MediaStreamContent::Video(MediaStreamVideo {
-                    codec: VideoCodec::H264,
-                    width: 1280,
-                    height: 720,
-                }),
-            },
-            MediaStream {
-                ssrc: 1337,
-                payload_type: 97,
-                content: MediaStreamContent::Audio(MediaStreamAudio {
-                    codec: AudioCodec::Opus,
-                }),
-            },
-        ],
-        40,
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-    );
+    // router_mut().register_stream(
+    //     1337,
+    //     vec![
+    //         MediaStream {
+    //             ssrc: 1338,
+    //             payload_type: 96,
+    //             content: MediaStreamContent::Video(MediaStreamVideo {
+    //                 codec: VideoCodec::H264,
+    //                 width: 1280,
+    //                 height: 720,
+    //             }),
+    //         },
+    //         MediaStream {
+    //             ssrc: 1337,
+    //             payload_type: 97,
+    //             content: MediaStreamContent::Audio(MediaStreamAudio {
+    //                 codec: AudioCodec::Opus,
+    //             }),
+    //         },
+    //     ],
+    //     40,
+    //     IpAddr::V4(Ipv4Addr::LOCALHOST),
+    // );
 
     match unsafe { callbacks.as_ref() } {
         Some(c) => unsafe { CALLBACKS = Some(c) },
@@ -238,7 +238,7 @@ extern "C" fn init(callbacks: *mut PluginCallbacks, _config_path: *const c_char)
         }
     }
 
-    RTPReceiver::new().start();
+    start_ingest();
     0
 }
 
@@ -448,7 +448,43 @@ extern "C" fn handle_message(
     }
 }
 
-extern "C" fn setup_media(_handle: *mut PluginSession) {}
+extern "C" fn setup_media(handle: *mut PluginSession) {
+    let wrapper = or_return!(unsafe { Session::from_ptr(handle) }.ok());
+    let subs = wrapper
+        .subscribed_to
+        .read()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let router = router();
+
+    for sub in subs {
+        let stream = or_continue!(router.get_stream(sub));
+        let packets = stream
+            .keyframe_buffer
+            .iter()
+            .flat_map(|(_, data)| data.clone())
+            .collect::<Vec<_>>();
+        for mut packet in packets {
+            let relay = callback().relay_rtp;
+            let mut rtp_packet = Box::new(janus_plugin_rtp {
+                video: 0,
+                buffer: packet.as_mut_ptr().cast(),
+                length: packet.len() as i16,
+                extensions: janus_plugin_rtp_extensions {
+                    audio_level: 0,
+                    audio_level_vad: 0,
+                    video_rotation: 0,
+                    video_back_camera: 0,
+                    video_flipped: 0,
+                },
+            });
+
+            relay(wrapper.handle, rtp_packet.as_mut());
+        }
+    }
+}
 
 extern "C" fn hangup_media(_handle: *mut PluginSession) {}
 
@@ -462,24 +498,6 @@ extern "C" fn incoming_rtcp(
     handle: *mut PluginSession,
     packet: *mut janus_plugin::PluginRtcpPacket,
 ) {
-    let xx = unsafe {
-        Vec::from_raw_parts(
-            (*packet).buffer.cast::<u8>(),
-            (*packet).length as usize,
-            (*packet).length as usize,
-        )
-    };
-    let pkt = xx.clone();
-    mem::forget(xx);
-
-    println!(
-        "{} => {:?}",
-        handle as i64,
-        ReceiverReportPacket::owned(pkt)
-            .map(|x| x.from_packet())
-            .and_then(|x| ReportBlockPacket::owned(x.payload))
-            .map(|x| x.from_packet())
-    );
 }
 
 unsafe extern "C" fn handle_admin_message(_message: *mut RawJanssonValue) -> *mut RawJanssonValue {

@@ -1,3 +1,4 @@
+use crate::threaded_rtp_handler::INGEST_MANAGER;
 use crate::{IncomingStreamHandle, SessionRef, Stream, StreamId};
 use janus_plugin::sdp::Sdp;
 use staaf_core::rpc::MediaStream;
@@ -97,6 +98,10 @@ impl Router {
         self.streams.get(&stream_index)
     }
 
+    pub fn get_stream_mut(&mut self, stream_index: StreamId) -> Option<&mut Stream> {
+        self.streams.get_mut(&stream_index)
+    }
+
     pub fn get_stream_id(&self, ssrc: u32, port: u16, ip_addr: IpAddr) -> Option<StreamId> {
         self.stream_map
             .get(&IncomingStreamHandle {
@@ -121,15 +126,18 @@ impl Router {
         }
 
         self.streams.insert(stream_index, stream);
-        for media_stream in media_streams {
-            self.stream_map.insert(
-                IncomingStreamHandle {
-                    ssrc: media_stream.ssrc,
-                    incoming_port: port,
-                    peer_addr: ip_addr,
-                },
-                stream_index,
-            );
+        for media_stream in &media_streams {
+            let handle = IncomingStreamHandle {
+                ssrc: media_stream.ssrc,
+                incoming_port: port,
+                peer_addr: ip_addr,
+            };
+            self.stream_map.insert(handle, stream_index);
+        }
+
+        {
+            let mut manager = INGEST_MANAGER.write().unwrap();
+            manager.register_stream(stream_index, ip_addr, port, media_streams);
         }
     }
 

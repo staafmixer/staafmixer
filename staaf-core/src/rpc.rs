@@ -16,6 +16,22 @@ pub enum MediaStreamContent {
     Audio(MediaStreamAudio),
 }
 
+impl MediaStreamContent {
+    pub fn is_video(&self) -> bool {
+        match self {
+            MediaStreamContent::Video(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_audio(&self) -> bool {
+        match self {
+            MediaStreamContent::Audio(_) => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 pub enum AudioCodec {
     Opus,
@@ -29,7 +45,7 @@ impl AudioCodec {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq)]
 pub enum VideoCodec {
     H264,
     VP9,
